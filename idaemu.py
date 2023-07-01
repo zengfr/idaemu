@@ -1,8 +1,10 @@
 from __future__ import print_function
 from unicorn import *
 from unicorn.x86_const import *
+#from unicorn.x64_const import *
 from unicorn.arm_const import *
 from unicorn.arm64_const import *
+from unicorn.mips_const import *
 from struct import unpack, pack, unpack_from, calcsize
 from idaapi import get_func
 #from idc import Qword, GetManyBytes, SelStart, SelEnd, here, ItemSize
@@ -18,7 +20,7 @@ TRACE_OFF = 0
 TRACE_DATA_READ = 1
 TRACE_DATA_WRITE = 2
 TRACE_CODE = 4
-
+TRACE_INTR = 8
 
 class Emu(object):
     def __init__(self, arch, mode, compiler=COMPILE_GCC, stack=0xf000000, \
@@ -34,6 +36,7 @@ class Emu(object):
         self.curUC = None
         self.traceOption = TRACE_OFF
         self.logBuffer = []
+        self.inst_skip_list=[]
         self.altFunc = {}
         self._init()
 
@@ -50,10 +53,10 @@ class Emu(object):
 
     def _hook_mem_access(self, uc, access, address, size, value, user_data):
         if access == UC_MEM_WRITE and self.traceOption & TRACE_DATA_WRITE:
-            self._addTrace("### Mem W:0x%08x, data size = %u, data value = 0x%08x" \
+            self._addTrace("### Mem W:0x%08x, size = %u, value = 0x%08x" \
                            % (address, size, value))
         elif access == UC_MEM_READ and self.traceOption & TRACE_DATA_READ:
-            self._addTrace("### Mem R:0x%08x, data size = %u" \
+            self._addTrace("### Mem R:0x%08x, size = %u" \
                            % (address, size))
     def _hook_code(self, uc, address, size, user_data):
         if self.traceOption & TRACE_CODE:
@@ -91,7 +94,8 @@ class Emu(object):
                     uc.reg_write(self.REG_SP, sp)
             except Exception as e:
                 self._addTrace("alt exception: %s" % e)
-
+        if address in self.inst_skip_list:
+          uc.reg_write(self.REG_PC, address+size)
     def _alignAddr(self, addr):
         return addr // PAGE_ALIGN * PAGE_ALIGN
 
@@ -158,25 +162,28 @@ class Emu(object):
             self.REG_ARGS = [UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
                              UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7]
 
-    def _initStackAndArgs(self, uc, RA, args):
-        uc.mem_map(self.stack, (self.ssize + 1) * PAGE_ALIGN)
+    def _initStackAndArgs(self, uc, RA, args,map=True):
+        if map:
+          uc.mem_map(self.stack, (self.ssize + 1) * PAGE_ALIGN)
         sp = self.stack + self.ssize * PAGE_ALIGN
         uc.reg_write(self.REG_SP, sp)
 
         if self.REG_RA == 0:
             uc.mem_write(sp, pack(self.pack_fmt, RA))
+            self._addTrace("mem_write: %s %s" % (sp, pack(self.pack_fmt, RA)))
         else:
             uc.reg_write(self.REG_RA, RA)
-
+            self._addTrace("reg_write: %s %s" % (self.REG_RA, RA))
         ## init the arguments
         i = 0
         while i < len(self.REG_ARGS) and i < len(args):
             uc.reg_write(self.REG_ARGS[i], args[i])
+            self._addTrace("reg_write: %s %s" % (self.REG_ARGS[i], args[i]))
             i += 1
-
         while i < len(args):
             sp += self.step
             uc.mem_write(sp, pack(self.pack_fmt, args[i]))
+            self._addTrace("mem_write: %s %s" % (sp, pack(self.pack_fmt, args[i])))
             i += 1
 
     def _getBit(self, value, offset):
@@ -283,13 +290,10 @@ class Emu(object):
     def _emulate(self, startAddr, stopAddr, args=[], TimeOut=0, Count=0):
         try:
             self.logBuffer = []
-            uc=None
-            if not self.curUC:
+            uc=self.curUC
+            if not uc:
               uc = Uc(self.arch, self.mode)
               self.curUC = uc
-              self._initData(uc)
-              self._initRegs(uc)
-              
               # add the invalid memory access hook
               uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | \
                           UC_HOOK_MEM_FETCH_UNMAPPED, self._hook_mem_invalid)
@@ -297,9 +301,14 @@ class Emu(object):
               # add the trace hook
               if self.traceOption & (TRACE_DATA_READ | TRACE_DATA_WRITE):
                   uc.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, self._hook_mem_access)
+              if self.traceOption & TRACE_INTR:
+                  uc.hook_add(UC_HOOK_INTR, self.hook_interrupt)
               uc.hook_add(UC_HOOK_CODE, self._hook_code)
-
-            self._initStackAndArgs(uc, stopAddr, args)
+              self._initStackAndArgs(uc, stopAddr, args,True)
+              self._initData(uc)
+              self._initRegs(uc)
+            else:
+              self._initStackAndArgs(uc, stopAddr, args,False)
             # start emulate
             uc.emu_start(startAddr, stopAddr, timeout=TimeOut, count=Count)
         except UcError as e:
@@ -354,7 +363,6 @@ class Emu(object):
     def showTrace(self):
         logs = "\n".join(self.logBuffer)
         print(logs)
-
     def alt(self, address, func, argc, balance=False):
         """
         If call the address, will call the func instead.
@@ -386,6 +394,9 @@ class Emu(object):
     def eUntilAddress(self, startAddr, stopAddr, args=[], TimeOut=0, Count=0):
         self._emulate(startAddr=startAddr, stopAddr=stopAddr, args=args, TimeOut=TimeOut, Count=Count)
         self._showRegs(self.curUC)
+    def hook_interrupt(self, emu, intno, data):
+        self._addTrace("Triggering interrupt #{:d}".format(intno))
+        return
     def eFunc2(self, address=None, retAddr=None, args=[], TimeOut=0, Count=0):
         if address == None: address = here()
         func = get_func(address)
@@ -396,17 +407,26 @@ class Emu(object):
             else:
                 print("Please offer the return address.")
                 return
+        self.logBuffer = []
         uc=self.curUC
-        self._initStackAndArgs(uc, retAddr, args)
+        self._initStackAndArgs(uc, retAddr, args,False)
         uc.emu_start(func.start_ea, retAddr, timeout=TimeOut, count=Count)
     def getAndsetAll(self,arch):
         uc=self.curUC
-        for address, data, init in self.data:
-          size=len(data)
-          data2=uc.mem_read(address, size)
-          self.setData(address,data2,True)
-        for rk,rv in get_register_map(arch).items:
-            self.setReg(rv,uc.reg_read(rv))
+        if uc:
+          for address, data, init in self.data:
+            size=len(data)
+            data2=uc.mem_read(address,size)
+            #self.setData(address,data2,True)
+            print("%08x:%04d %s"%(address,size,data2))
+          for it in self.get_register_map(arch):
+            v=uc.reg_read(it[1])
+            #self.setReg(it[1],v)
+            print("%s:%s"%(it[0],v))
+    def setInstSkip(self, address):
+        self.inst_skip_list.append(address)
+    def showLine(self,len=128):
+        print("-"*len)
     def printRegs(self,regs):
         s='\t'*6
         idx=0
@@ -414,15 +434,13 @@ class Emu(object):
             s=s+"r%s:0x%x "%(idx,self.curUC.reg_read(reg))
             idx=idx+1
         self._addTrace(s)
-    @staticmethod
-    def get_register_map(arch):
+    def get_register_map(self,arch):
         if arch.startswith("arm64"):
             arch = "arm64"
         elif arch.startswith("arm"):
             arch = "arm"
         elif arch.startswith("mips"):
             arch = "mips"
-
         registers = {
             "x64" : [
                 [ "rax",    UC_X86_REG_RAX  ],
